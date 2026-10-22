@@ -1,0 +1,83 @@
+param([string]$Target='qrtest.hncb.com.tw',[int]$Port=443)
+
+Write-Host "== 1. .NET SslStream (只允許 TLS 1.3) ==" -ForegroundColor Cyan
+try {
+  $tcp = [Net.Sockets.TcpClient]::new($Target,$Port)
+  $cb  = [Net.Security.RemoteCertificateValidationCallback]{param($s,$c,$ch,$e) $true}
+  $ssl = [Net.Security.SslStream]::new($tcp.GetStream(),$false,$cb)
+  $ssl.AuthenticateAsClient($Target,$null,[Security.Authentication.SslProtocols]'Tls13',$false)
+  "Protocol : $($ssl.SslProtocol)"
+  "Cipher   : $($ssl.NegotiatedCipherSuite)"
+  $ssl.Dispose(); $tcp.Close()
+} catch {
+  Write-Host "FAIL: $($_.Exception.Message) $($_.Exception.InnerException.Message)" -ForegroundColor Red
+  Write-Host "(Windows PowerShell 5.1 / 舊版 Windows 可能不支援 Tls13，請改用 PowerShell 7)" -ForegroundColor Yellow
+}
+
+Write-Host "`n== 2. Node.js 金鑰交換群組測試 ==" -ForegroundColor Cyan
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+  Write-Host "找不到 node，請先安裝 Node.js" -ForegroundColor Red
+} else {
+  "Node $(node -v), OpenSSL $(node -p 'process.versions.openssl')"
+  $js = Join-Path $env:TEMP 'tls13-probe.js'
+@'
+const tls = require('tls');
+const host = process.argv[2], port = +process.argv[3];
+const tests = [
+  ['TLS1.3 預設群組 (不指定)', undefined],
+  ['TLS1.3 僅 X25519', 'X25519'],
+  ['TLS1.3 僅 P-256', 'prime256v1'],
+  ['TLS1.3 僅 P-384', 'secp384r1'],
+  ['TLS1.3 僅 P-521', 'secp521r1'],
+  ['TLS1.3 X25519MLKEM768', 'X25519MLKEM768'],
+];
+function probe(label, curve, min, max) {
+  return new Promise(res => {
+    const o = { host, port, servername: host, minVersion: min, maxVersion: max,
+                rejectUnauthorized: false, timeout: 8000 };
+    if (curve) o.ecdhCurve = curve;
+    let s;
+    try { s = tls.connect(o); }
+    catch (e) { return res({ label, ok: false, err: '本機不支援: ' + e.message }); }
+    s.once('secureConnect', () => {
+      const r = { label, ok: true, proto: s.getProtocol(), cipher: s.getCipher().name,
+                  kx: s.getEphemeralKeyInfo(), authorized: s.authorized,
+                  authError: s.authorizationError, cert: s.getPeerCertificate() };
+      s.end(); res(r);
+    });
+    s.once('error', e => res({ label, ok: false, err: e.code || e.message }));
+    s.once('timeout', () => { s.destroy(); res({ label, ok: false, err: 'timeout' }); });
+  });
+}
+(async () => {
+  let cert;
+  for (const [label, curve] of tests) {
+    const r = await probe(label, curve, 'TLSv1.3', 'TLSv1.3');
+    if (r.ok) {
+      console.log('[PASS] ' + label + ' => ' + r.proto + ' / ' + r.cipher +
+                  ' / 群組=' + (r.kx.name || '?') + ' (' + (r.kx.size || '?') + ' bits)');
+      cert = cert || r;
+    } else console.log('[FAIL] ' + label + ' => ' + r.err);
+  }
+  const r12 = await probe('TLS1.2 only', undefined, 'TLSv1.2', 'TLSv1.2');
+  console.log(r12.ok ? '[INFO] TLS1.2 亦可連線: ' + r12.cipher : '[INFO] TLS1.2 不可連線: ' + r12.err);
+  if (cert) {
+    const c = cert.cert;
+    console.log('\n憑證: CN=' + (c.subject && c.subject.CN) + ' | 簽發者=' + (c.issuer && c.issuer.O));
+    console.log('有效期: ' + c.valid_from + ' ~ ' + c.valid_to);
+    console.log('系統信任: ' + cert.authorized + (cert.authError ? ' (' + cert.authError + ')' : ''));
+  }
+})();
+'@ | Set-Content -Path $js -Encoding UTF8
+  node $js $Target $Port
+}
+
+Write-Host "`n== 3. OpenSSL (選用, 若已安裝) ==" -ForegroundColor Cyan
+if (Get-Command openssl -ErrorAction SilentlyContinue) {
+  foreach ($g in 'X25519','secp256r1','secp384r1','X25519MLKEM768') {
+    $out = '' | openssl s_client -connect "${Target}:$Port" -servername $Target -tls1_3 -groups $g 2>&1 | Out-String
+    $m = [regex]::Match($out,'(Negotiated TLS1\.3 group|Server Temp Key):\s*(.+)')
+    if ($m.Success) { "[PASS] -groups $g => $($m.Groups[2].Value.Trim())" }
+    else            { "[FAIL] -groups $g" }
+  }
+} else { "未安裝 openssl，略過" }
